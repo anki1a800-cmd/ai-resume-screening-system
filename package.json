@@ -1,0 +1,20 @@
+{
+  "name": "ai-resume-screening-system-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-Stack AI Resume Screening System (Next.js & Java Spring Boot)",
+  "scripts": {
+    "dev": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm start",
+    "backend": "cd backend && mvn spring-boot:run"
+  },
+  "keywords": [
+    "resume-screening",
+    "spring-boot",
+    "nextjs",
+    "pdfbox",
+    "poi",
+    "full-stack"
+  ]
+}
