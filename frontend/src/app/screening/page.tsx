@@ -51,7 +51,7 @@ export default function ScreeningLabPage() {
     // Simulated parsing delay mimicking Apache PDFBox / Apache POI extraction
     await new Promise((res) => setTimeout(res, 600));
 
-    const result = screenCustomResume(
+    const result = await screenCustomResume(
       selectedJobId,
       customResumeText,
       customCandidateName,

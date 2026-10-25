@@ -19,6 +19,7 @@ import {
   MOCK_APPLICATIONS,
   MOCK_AUDIT_LOGS,
 } from '../data/mockData';
+import { api } from '../services/api';
 
 interface AppContextType {
   currentUser: User | null;
@@ -36,20 +37,20 @@ interface AppContextType {
   
   // Auth & Demo
   loginAsDemo: (role: UserRole) => void;
-  login: (email: string, role?: UserRole) => Promise<{ success: boolean; message: string }>;
+  login: (email: string, role?: UserRole, password?: string) => Promise<{ success: boolean; message: string }>;
   logout: () => void;
   
   // Recruitment actions
-  createJob: (jobData: Omit<Job, 'id' | 'createdAt' | 'companyId' | 'companyName' | 'companyLogo'>) => Job;
-  updateJobStatus: (jobId: string, status: Job['status']) => void;
+  createJob: (jobData: Omit<Job, 'id' | 'createdAt' | 'companyId' | 'companyName' | 'companyLogo'>) => Promise<Job>;
+  updateJobStatus: (jobId: string, status: Job['status']) => Promise<void>;
   applyForJob: (jobId: string, resumeFileName?: string, resumeText?: string) => Promise<Application>;
-  screenApplication: (applicationId: string) => ScreeningResult;
-  screenCustomResume: (jobId: string, resumeText: string, candidateName: string, resumeFileName: string) => ScreeningResult;
-  updateApplicationStatus: (applicationId: string, status: ApplicationStatus) => void;
+  screenApplication: (applicationId: string) => Promise<ScreeningResult>;
+  screenCustomResume: (jobId: string, resumeText: string, candidateName: string, resumeFileName: string) => Promise<ScreeningResult>;
+  updateApplicationStatus: (applicationId: string, status: ApplicationStatus) => Promise<void>;
   
   // Admin actions
-  approveCompany: (companyId: string) => void;
-  suspendCompany: (companyId: string) => void;
+  approveCompany: (companyId: string) => Promise<void>;
+  suspendCompany: (companyId: string) => Promise<void>;
   
   // Candidate actions
   updateCandidateProfile: (updates: Partial<Candidate>) => void;
@@ -62,16 +63,13 @@ interface AppContextType {
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  // Demo default: starts not logged in, but with full demo data ready
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isDemoMode, setIsDemoMode] = useState<boolean>(true);
   const [demoRole, setDemoRole] = useState<UserRole | null>(null);
   
-  // Backend connection flag (Stage 1 is preview/demo; Spring Boot is Stage 2)
   const [isBackendConnected, setIsBackendConnected] = useState<boolean>(false);
   const backendApiUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8080/api';
 
-  // Data states
   const [companies, setCompanies] = useState<Company[]>(MOCK_COMPANIES);
   const [jobs, setJobs] = useState<Job[]>(MOCK_JOBS);
   const [candidates, setCandidates] = useState<Candidate[]>(MOCK_CANDIDATES);
@@ -81,23 +79,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const activeCompany = companies.find((c) => c.id === 'comp-novatech') || companies[0];
   const activeCandidate = candidates.find((c) => c.id === 'cand-alex-morgan') || candidates[0];
 
-  // Check backend health on mount
+  // Periodic health check
   useEffect(() => {
     const checkBackend = async () => {
       try {
-        const res = await fetch(`${backendApiUrl}/health`, { method: 'GET', signal: AbortSignal.timeout(1500) });
-        if (res.ok) {
+        const res = await api.checkHealth();
+        if (res && res.status === 'UP') {
           setIsBackendConnected(true);
         }
       } catch {
-        // Backend not yet running - normal in Stage 1 Preview
         setIsBackendConnected(false);
       }
     };
     checkBackend();
-  }, [backendApiUrl]);
+    const interval = setInterval(checkBackend, 15000);
+    return () => clearInterval(interval);
+  }, []);
 
-  // Demo Login Handler
   const loginAsDemo = (role: UserRole) => {
     setIsDemoMode(true);
     setDemoRole(role);
@@ -131,10 +129,26 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     addAuditLog(role, 'DEMO_LOGIN', `Logged into ${role} demo dashboard with isolated sample data.`);
   };
 
-  // Regular Login handler
-  const login = async (email: string, designatedRole: UserRole = 'CANDIDATE') => {
-    // If backend is connected, would call backend POST /api/auth/login
-    // In Stage 1 Preview:
+  const login = async (email: string, designatedRole: UserRole = 'CANDIDATE', password?: string) => {
+    if (isBackendConnected && password) {
+      try {
+        const res = await api.auth.login({ email, password });
+        api.setToken(res.token);
+        setIsDemoMode(false);
+        setCurrentUser({
+          id: res.id,
+          email: res.email,
+          name: res.name || email.split('@')[0],
+          role: res.role as UserRole,
+          isDemo: false,
+        });
+        return { success: true, message: 'Logged in via Spring Boot backend.' };
+      } catch (err: any) {
+        console.warn('Backend login error, falling back to simulated session:', err.message);
+      }
+    }
+
+    // Preview / Standalone session
     setIsDemoMode(false);
     setCurrentUser({
       id: `usr-${Date.now()}`,
@@ -143,10 +157,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       role: designatedRole,
       isDemo: false,
     });
-    return { success: true, message: 'Authenticated successfully in Preview Mode.' };
+    return { success: true, message: 'Authenticated in Preview Mode.' };
   };
 
   const logout = () => {
+    api.setToken(null);
     setCurrentUser(null);
     setDemoRole(null);
     setIsDemoMode(true);
@@ -173,13 +188,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     companyName: string,
     applicationId: string
   ): ScreeningResult => {
-    const textLower = resumeText.toLowerCase();
+    const textLower = (resumeText || '').toLowerCase();
     const matchedSkills: string[] = [];
     const missingSkills: string[] = [];
 
     requiredSkills.forEach((skill) => {
       const cleanSkill = skill.trim();
-      // Regex boundary check or sub-token check
       const escaped = cleanSkill.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const regex = new RegExp(`(^|[^a-zA-Z0-9#+])${escaped}([^a-zA-Z0-9#+]|$)`, 'i');
       if (regex.test(textLower) || textLower.includes(cleanSkill.toLowerCase())) {
@@ -225,7 +239,35 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   };
 
-  const screenApplication = (applicationId: string): ScreeningResult => {
+  const screenApplication = async (applicationId: string): Promise<ScreeningResult> => {
+    if (isBackendConnected) {
+      try {
+        const res = await api.screening.evaluate(applicationId);
+        const result: ScreeningResult = {
+          id: res.id,
+          applicationId: res.applicationId,
+          candidateName: res.candidateName,
+          jobTitle: res.jobTitle,
+          companyName: res.companyName,
+          matchPercentage: res.matchPercentage,
+          totalRequiredSkills: res.totalRequiredSkills,
+          matchedCount: res.matchedCount,
+          matchedSkills: res.matchedSkills,
+          missingSkills: res.missingSkills,
+          scoringFormula: res.scoringFormula,
+          explanation: res.explanation,
+          screenedAt: res.screenedAt,
+          suggestionsForCandidate: res.suggestions,
+        };
+        setApplications((prev) =>
+          prev.map((a) => (a.id === applicationId ? { ...a, screeningResult: result } : a))
+        );
+        return result;
+      } catch (err) {
+        console.warn('Backend screening failed, falling back to local calculation');
+      }
+    }
+
     const app = applications.find((a) => a.id === applicationId);
     if (!app) throw new Error('Application not found');
 
@@ -251,16 +293,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return result;
   };
 
-  const screenCustomResume = (
+  const screenCustomResume = async (
     jobId: string,
     resumeText: string,
     candidateName: string,
     resumeFileName: string
-  ): ScreeningResult => {
+  ): Promise<ScreeningResult> => {
     const job = jobs.find((j) => j.id === jobId);
     const requiredSkills = job ? job.requiredSkills : ['Java', 'Spring Boot', 'REST APIs', 'PostgreSQL'];
     const jobTitle = job ? job.title : 'General Engineering Role';
     const compName = job ? job.companyName : 'NovaTech Solutions';
+
+    if (isBackendConnected) {
+      try {
+        const res = await api.screening.simulate({
+          resumeText,
+          requiredSkills,
+          jobTitle,
+          candidateName,
+        });
+        return {
+          id: res.id,
+          applicationId: res.applicationId,
+          candidateName: res.candidateName,
+          jobTitle: res.jobTitle,
+          companyName: res.companyName,
+          matchPercentage: res.matchPercentage,
+          totalRequiredSkills: res.totalRequiredSkills,
+          matchedCount: res.matchedCount,
+          matchedSkills: res.matchedSkills,
+          missingSkills: res.missingSkills,
+          scoringFormula: res.scoringFormula,
+          explanation: res.explanation,
+          screenedAt: res.screenedAt,
+          suggestionsForCandidate: res.suggestions,
+        };
+      } catch (err) {
+        console.warn('Backend simulator failed, using local engine');
+      }
+    }
 
     return calculateSkillMatch(
       resumeText,
@@ -301,7 +372,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       status: 'APPLIED',
     };
 
-    // Calculate initial screening in background
     const screenRes = calculateSkillMatch(
       extracted,
       job.requiredSkills,
@@ -314,19 +384,36 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     setApplications((prev) => [newApp, ...prev]);
     addAuditLog('CANDIDATE', 'JOB_APPLICATION', `${candidate.name} submitted application for ${job.title} at ${job.companyName}`);
+
+    if (isBackendConnected) {
+      try {
+        await api.applications.apply(jobId);
+      } catch (e) {
+        console.warn('Backend application sync:', e);
+      }
+    }
+
     return newApp;
   };
 
-  const updateApplicationStatus = (applicationId: string, status: ApplicationStatus) => {
+  const updateApplicationStatus = async (applicationId: string, status: ApplicationStatus) => {
     setApplications((prev) =>
       prev.map((app) => (app.id === applicationId ? { ...app, status } : app))
     );
     addAuditLog('COMPANY', 'STATUS_CHANGE', `Application ${applicationId} status updated to ${status}`);
+
+    if (isBackendConnected) {
+      try {
+        await api.applications.updateStatus(applicationId, status);
+      } catch (e) {
+        console.warn('Backend status update sync:', e);
+      }
+    }
   };
 
-  const createJob = (
+  const createJob = async (
     jobData: Omit<Job, 'id' | 'createdAt' | 'companyId' | 'companyName' | 'companyLogo'>
-  ): Job => {
+  ): Promise<Job> => {
     const newJob: Job = {
       ...jobData,
       id: `job-nova-${Date.now().toString().slice(-4)}`,
@@ -338,25 +425,57 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     setJobs((prev) => [newJob, ...prev]);
     addAuditLog('COMPANY', 'JOB_CREATED', `Created new job: ${newJob.title}`);
+
+    if (isBackendConnected) {
+      try {
+        await api.jobs.createJob(jobData);
+      } catch (e) {
+        console.warn('Backend job create sync:', e);
+      }
+    }
+
     return newJob;
   };
 
-  const updateJobStatus = (jobId: string, status: Job['status']) => {
+  const updateJobStatus = async (jobId: string, status: Job['status']) => {
     setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, status } : j)));
+    if (isBackendConnected) {
+      try {
+        await api.jobs.updateStatus(jobId, status);
+      } catch (e) {
+        console.warn('Backend job status sync:', e);
+      }
+    }
   };
 
-  const approveCompany = (companyId: string) => {
+  const approveCompany = async (companyId: string) => {
     setCompanies((prev) =>
       prev.map((c) => (c.id === companyId ? { ...c, status: 'APPROVED' } : c))
     );
     addAuditLog('SUPERADMIN', 'COMPANY_APPROVAL', `Company ${companyId} approved for platform access.`);
+
+    if (isBackendConnected) {
+      try {
+        await api.admin.approveCompany(companyId);
+      } catch (e) {
+        console.warn('Backend approve sync:', e);
+      }
+    }
   };
 
-  const suspendCompany = (companyId: string) => {
+  const suspendCompany = async (companyId: string) => {
     setCompanies((prev) =>
       prev.map((c) => (c.id === companyId ? { ...c, status: 'SUSPENDED' } : c))
     );
     addAuditLog('SUPERADMIN', 'COMPANY_SUSPENSION', `Company ${companyId} suspended.`);
+
+    if (isBackendConnected) {
+      try {
+        await api.admin.suspendCompany(companyId);
+      } catch (e) {
+        console.warn('Backend suspend sync:', e);
+      }
+    }
   };
 
   const updateCandidateProfile = (updates: Partial<Candidate>) => {
